@@ -1,0 +1,8 @@
+streamlit
+sqlalchemy
+passlib[bcrypt]
+icalendar
+plotly
+pandas
+pillow
+python-dateutil
