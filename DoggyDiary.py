@@ -3,11 +3,14 @@
 # Doggy Diary — Streamlit app for dog hotels (multi-tenant)
 # Profiles, bookings (recurring, discounts, paid), calendar (grid + timelines),
 # pricing, capacity/daily limits, insights, export to .ics.
+# Adds: Account recovery + Contact Us + Admin dashboard, Streamlit API updates.
 
 from __future__ import annotations
 
+import os, smtplib, random
 import calendar as pycal
 import math
+from email.message import EmailMessage
 from datetime import datetime, date, time, timedelta, timezone
 from pathlib import Path
 from typing import Optional, List, Tuple, Dict
@@ -31,7 +34,8 @@ st.set_page_config(page_title="Doggy Diary", page_icon="🐶", layout="wide")
 APP_DIR = Path(__file__).parent.resolve()
 DATA_DIR = APP_DIR / "data"
 UPLOAD_DIR = DATA_DIR / "uploads"
-for p in (DATA_DIR, UPLOAD_DIR):
+OUTBOX_DIR = DATA_DIR / "outbox"
+for p in (DATA_DIR, UPLOAD_DIR, OUTBOX_DIR):
     p.mkdir(parents=True, exist_ok=True)
 
 DATABASE_URL = f"sqlite:///{(DATA_DIR / 'doggy_diary.db').as_posix()}"
@@ -39,6 +43,14 @@ DATABASE_URL = f"sqlite:///{(DATA_DIR / 'doggy_diary.db').as_posix()}"
 DEFAULT_TZ = "Europe/London"
 SERVICE_TYPES = ["walk", "daycare", "overnight", "home_visit"]
 DEFAULT_CAPACITY = {"walk": 4, "daycare": 6, "overnight": 2, "home_visit": 3}
+
+# Support & app URL (kept hidden in UI)
+SUPPORT_TO = os.environ.get("SUPPORT_TO", "evancawley@outlook.com")
+try:
+    # Avoid hard fail if secrets.toml is not present
+    APP_BASE_URL = st.secrets.get("app_base_url")
+except Exception:
+    APP_BASE_URL = os.environ.get("APP_BASE_URL")
 
 Base = declarative_base()
 engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False}, future=True)
@@ -147,10 +159,21 @@ class Booking(Base):
     dog = relationship("Dog", back_populates="bookings")
 
 
+class PasswordReset(Base):
+    __tablename__ = "password_resets"
+    id = Column(Integer, primary_key=True)
+    user_id = Column(String, index=True, nullable=False)
+    token = Column(String, unique=True, index=True)
+    code = Column(String)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    expires_at = Column(DateTime(timezone=True))
+    used_at = Column(DateTime(timezone=True))
+
+
 Base.metadata.create_all(bind=engine)
 
 
-# ---------- Migrations (robust: composite uniques, dedupe, indexes) ----------
+# ---------- Migrations (robust) ----------
 from sqlalchemy import text as _sql_text
 
 def _table_sql(conn, name: str) -> str | None:
@@ -177,29 +200,21 @@ def _unique_indexes(conn, table: str):
     return out
 
 def _needs_rebuild_capacities(conn) -> bool:
-    if not _table_exists(conn, "capacities"):
-        return False
-    if not _has_col(conn, "capacities", "owner_id"):
-        return True
+    if not _table_exists(conn, "capacities"): return False
+    if not _has_col(conn, "capacities", "owner_id"): return True
     sql = _table_sql(conn, "capacities") or ""
-    if "UNIQUE" in sql and "owner_id" not in sql and "service_type" in sql:
-        return True
+    if "UNIQUE" in sql and "owner_id" not in sql and "service_type" in sql: return True
     for _, is_unique, cols in _unique_indexes(conn, "capacities"):
-        if is_unique and cols == ["service_type"]:
-            return True
+        if is_unique and cols == ["service_type"]: return True
     return False
 
 def _needs_rebuild_daily_caps(conn) -> bool:
-    if not _table_exists(conn, "daily_caps"):
-        return True
-    if not _has_col(conn, "daily_caps", "owner_id"):
-        return True
+    if not _table_exists(conn, "daily_caps"): return True
+    if not _has_col(conn, "daily_caps", "owner_id"): return True
     sql = _table_sql(conn, "daily_caps") or ""
-    if "UNIQUE" in sql and "owner_id" not in sql and "service_type" in sql:
-        return True
+    if "UNIQUE" in sql and "owner_id" not in sql and "service_type" in sql: return True
     for _, is_unique, cols in _unique_indexes(conn, "daily_caps"):
-        if is_unique and cols == ["service_type"]:
-            return True
+        if is_unique and cols == ["service_type"]: return True
     return False
 
 def _rebuild_capacities(conn):
@@ -244,7 +259,7 @@ def _rebuild_daily_caps(conn):
 
 def run_migrations():
     with engine.begin() as conn:
-        # 1) Ensure required columns
+        # Ensure required columns
         for t in ["settings", "capacities", "daily_caps", "owner_profile", "dogs", "bookings"]:
             if _table_exists(conn, t) and not _has_col(conn, t, "owner_id"):
                 conn.execute(_sql_text(f"ALTER TABLE {t} ADD COLUMN owner_id TEXT"))
@@ -287,13 +302,11 @@ def run_migrations():
                     conn.execute(_sql_text(f"ALTER TABLE bookings ADD COLUMN {c} {typ}"))
             conn.execute(_sql_text("UPDATE bookings SET status='pending' WHERE status='tentative'"))
 
-        # 2) Rebuild capacities/daily_caps with composite uniques
-        if _needs_rebuild_capacities(conn):
-            _rebuild_capacities(conn)
-        if _needs_rebuild_daily_caps(conn):
-            _rebuild_daily_caps(conn)
+        # Build capacities/daily_caps with composite uniques
+        if _needs_rebuild_capacities(conn): _rebuild_capacities(conn)
+        if _needs_rebuild_daily_caps(conn): _rebuild_daily_caps(conn)
 
-        # 3) De-dupe singleton tables (settings, owner_profile) and enforce one-per-owner
+        # De-dupe singleton tables and enforce one-per-owner
         conn.execute(_sql_text("""
             DELETE FROM settings
             WHERE owner_id IS NOT NULL
@@ -311,14 +324,63 @@ def run_migrations():
         conn.execute(_sql_text("CREATE UNIQUE INDEX IF NOT EXISTS ux_settings_owner ON settings(owner_id)"))
         conn.execute(_sql_text("CREATE UNIQUE INDEX IF NOT EXISTS ux_owner_profile_owner ON owner_profile(owner_id)"))
 
-        # 4) Helpful indexes
+        # Helpful indexes
         conn.execute(_sql_text("CREATE INDEX IF NOT EXISTS ix_bookings_owner ON bookings(owner_id)"))
         conn.execute(_sql_text("CREATE INDEX IF NOT EXISTS ix_bookings_time ON bookings(start_utc, end_utc)"))
         conn.execute(_sql_text("CREATE INDEX IF NOT EXISTS ix_dogs_owner ON dogs(owner_id)"))
         conn.execute(_sql_text("CREATE UNIQUE INDEX IF NOT EXISTS ux_capacity_owner_service ON capacities(owner_id, service_type)"))
         conn.execute(_sql_text("CREATE UNIQUE INDEX IF NOT EXISTS ux_dailycap_owner_service ON daily_caps(owner_id, service_type)"))
 
+        # Password resets table (if missing)
+        if not _table_exists(conn, "password_resets"):
+            conn.execute(_sql_text("""
+                CREATE TABLE password_resets (
+                    id INTEGER PRIMARY KEY,
+                    user_id TEXT NOT NULL,
+                    token TEXT UNIQUE,
+                    code TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    expires_at TIMESTAMP,
+                    used_at TIMESTAMP
+                )
+            """))
+            conn.execute(_sql_text("CREATE INDEX IF NOT EXISTS ix_pwreset_user ON password_resets(user_id)"))
+            conn.execute(_sql_text("CREATE INDEX IF NOT EXISTS ix_pwreset_token ON password_resets(token)"))
+
 run_migrations()
+
+
+# ---------------- Email helpers ----------------
+def _smtp_creds_ok():
+    return all(os.environ.get(k) for k in ("SMTP_HOST", "SMTP_USER", "SMTP_PASS"))
+
+def send_email(to_email: str, subject: str, body: str) -> bool:
+    """Return True if sent over SMTP; otherwise save to outbox file and return False."""
+    try:
+        if not _smtp_creds_ok():
+            ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+            f = OUTBOX_DIR / f"mail-{ts}.txt"
+            f.write_text(f"TO: {to_email}\nSUBJECT: {subject}\n\n{body}", encoding="utf-8")
+            return False
+        host = os.environ.get("SMTP_HOST"); port = int(os.environ.get("SMTP_PORT", "587"))
+        user = os.environ.get("SMTP_USER"); pwd = os.environ.get("SMTP_PASS")
+        use_tls = os.environ.get("SMTP_TLS", "1") not in ("0", "false", "False")
+        from_addr = os.environ.get("SMTP_FROM", user)
+        msg = EmailMessage()
+        msg["From"] = from_addr
+        msg["To"] = to_email
+        msg["Subject"] = subject
+        msg.set_content(body)
+        with smtplib.SMTP(host, port, timeout=20) as s:
+            if use_tls: s.starttls()
+            s.login(user, pwd)
+            s.send_message(msg)
+        return True
+    except Exception:
+        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+        f = OUTBOX_DIR / f"mail-{ts}.txt"
+        f.write_text(f"TO: {to_email}\nSUBJECT: {subject}\n\n{body}", encoding="utf-8")
+        return False
 
 
 # ---------------- Auth & defaults ----------------
@@ -337,6 +399,9 @@ def verify_pwd(p: str, h: str) -> bool:
 
 def current_user_id() -> Optional[str]:
     return st.session_state.get("user_id")
+
+def is_admin() -> bool:
+    return bool(st.session_state.get("is_admin"))
 
 def ensure_user_defaults(owner_id: str, email: str, *, db: Optional[Session] = None):
     """Create or adopt per-owner defaults, and hard-dedupe duplicates so later lookups are safe."""
@@ -662,12 +727,19 @@ def topbar():
             st.session_state.page = "My Profile"
             st.rerun()
     with cols[2]:
-        if current_user_id() and st.button("Log out", key="logout_btn"):
-            for k in list(st.session_state.keys()):
-                if k.startswith(("user_", "bk_", "cal_", "sb_", "home_", "prof_")) or k in ("page", "booking_mode"):
-                    st.session_state.pop(k, None)
-            st.session_state.pop("user_id", None)
-            st.session_state.pop("user_name", None)
+        if is_admin() and st.session_state.get("impersonated_by_admin"):
+            if st.button("Exit impersonation", key="exit_imp_btn"):
+                # keep admin, drop impersonation
+                st.session_state.pop("user_id", None)
+                st.session_state.pop("user_name", None)
+                st.session_state.pop("impersonated_by_admin", None)
+                st.session_state.page = "Admin"
+                st.rerun()
+        if st.button("Log out", key="logout_btn"):
+            # full logout
+            keys = list(st.session_state.keys())
+            for k in keys:
+                st.session_state.pop(k, None)
             st.rerun()
 
 def nav_home():
@@ -829,7 +901,7 @@ def my_profile_section():
         # Entire current year by default (1 Jan → 31 Dec)
         this_year = datetime.now().year
         default_start = date(this_year, 1, 1)
-        default_end = date(this_year, 12, 31)  # full year, not just to today
+        default_end = date(this_year, 12, 31)  # full year
         custom = st.checkbox("Use custom dates", value=False, key="prof_custom_dates")
         if custom:
             c = st.columns(3)
@@ -993,7 +1065,7 @@ def bookings_section():
             st.info("Add a dog first in **Doggy Profiles**.")
             return
 
-        # Quick Edit: jump straight to edit a booking (min clicks)
+        # Quick Edit
         df_all = bookings_df(db, owner_id, tz_name)
         if not df_all.empty:
             quick_label_map = {r["ID"]: f"{r['Dog']} — {r['Service']} — {r['Start (local)']:%d %b %H:%M}"
@@ -1012,7 +1084,7 @@ def bookings_section():
         if mode == "Add / Edit":
             left, right = st.columns([1.55, 0.45])
             with left:
-                # Dog select by ID (no ORM objects in widgets)
+                # Dog select by ID
                 dogs_by_id = {d.id: d for d in dogs}
                 dog_options = list(dogs_by_id.keys())
                 if "bk_dog_id" not in st.session_state and dog_options:
@@ -1043,7 +1115,6 @@ def bookings_section():
                                            format="DD/MM/YYYY", key="bk_edate")
                     e_time = st.time_input("End time *", value=st.session_state.get("bk_etime", time(10, 0)), key="bk_etime")
                 else:
-                    # Ease-of-life: end date is implicitly same-day; show as info
                     e_date = s_date
                     e_time = st.time_input("End time * (same day)", value=st.session_state.get("bk_etime", time(17, 0)), key="bk_etime")
 
@@ -1388,7 +1459,8 @@ def calendar_section():
                     first = focus.replace(day=1)
                     prev_end = first - timedelta(days=1)
                     st.session_state.cal_focus = prev_end.replace(day=1); st.rerun()
-                hdr[1].date_input("Month", value=focus, key="cal_month_picker", format="DD/MM/YYYY")
+                # picker uses query_params-safe value
+                _ = hdr[1].date_input("Month", value=focus, key="cal_month_picker", format="DD/MM/YYYY")
                 if hdr[2].button("Next ▶︎", key="cal_grid_next"):
                     y = focus.year + (1 if focus.month == 12 else 0)
                     m = 1 if focus.month == 12 else focus.month + 1
@@ -1430,7 +1502,7 @@ def calendar_section():
                 if hdr[0].button("◀︎ Prev", key="cal_tl_prev"):
                     first = focus.replace(day=1); prev_end = first - timedelta(days=1)
                     st.session_state.cal_focus = prev_end.replace(day=1); st.rerun()
-                hdr[1].date_input("Month", value=focus, key="cal_month_picker_t", format="DD/MM/YYYY")
+                _ = hdr[1].date_input("Month", value=focus, key="cal_month_picker_t", format="DD/MM/YYYY")
                 if hdr[2].button("Next ▶︎", key="cal_tl_next"):
                     y = focus.year + (1 if focus.month == 12 else 0)
                     m = 1 if focus.month == 12 else focus.month + 1
@@ -1619,18 +1691,46 @@ def settings_section():
             db.commit(); st.success("Settings saved ✅")
 
 
-# ---------------- Auth page ----------------
+# ---------------- Auth pages (improved) ----------------
 def auth_page():
     st.title("🐶 Doggy Diary")
-    st.subheader("Sign in or create an account")
+    st.subheader("Welcome back")
     tab_login, tab_reg = st.tabs(["Sign in", "Create account"])
+
+    # Capture reset token from URL and route directly to reset page (new API)
+    params = st.query_params
+    token_from_url = None
+    if "reset_token" in params:
+        v = params.get("reset_token")
+        token_from_url = v[0] if isinstance(v, list) else v
+    if token_from_url:
+        st.session_state["reset_token"] = token_from_url
+        st.session_state.page = "Reset Password"
+        st.query_params.clear()  # clear params
+        st.rerun()
+
     with SessionLocal() as db:
         with tab_login:
             with st.form("login_form"):
                 email = st.text_input("Email")
                 pw = st.text_input("Password", type="password")
-                ok = st.form_submit_button("Sign in", type="primary", use_container_width=True)
+                c1, c2 = st.columns([0.5, 0.5])
+                ok = c1.form_submit_button("Sign in", type="primary", use_container_width=True)
+                if c2.form_submit_button("Forgot password?", use_container_width=True):
+                    st.session_state.page = "Recover Account"; st.rerun()
+            l2 = st.columns([0.5, 0.5])
+            if l2[0].button("Contact us", help="Get help from our team", use_container_width=True, key="login_contact"):
+                st.session_state.page = "Contact Us"; st.rerun()
+
             if ok:
+                # Admin backdoor (username 'admin', password 'AdminPassword')
+                if email.strip().lower() == "admin" and pw == "AdminPassword":
+                    st.session_state["is_admin"] = True
+                    st.session_state["user_id"] = None
+                    st.session_state["user_name"] = "Admin"
+                    st.session_state.page = "Admin"
+                    st.rerun()
+
                 u = db.execute(select(User).where(User.email == email.strip().lower())).scalar_one_or_none()
                 if not u or not verify_pwd(pw, u.password_hash):
                     st.error("Invalid email or password.")
@@ -1640,6 +1740,7 @@ def auth_page():
                     ensure_user_defaults(u.id, u.email, db=db)
                     adopt_legacy_rows(u.id, db=db)
                     st.rerun()
+
         with tab_reg:
             with st.form("reg_form"):
                 name = st.text_input("Full name")
@@ -1652,24 +1753,249 @@ def auth_page():
                     st.error("Enter a valid email."); return
                 if pw1 != pw2 or len(pw1) < 6:
                     st.error("Passwords must match and be at least 6 chars."); return
-                exists = db.execute(select(User).where(User.email == email.strip().lower())).scalar_one_or_none()
-                if exists:
-                    st.error("Email already registered."); return
-                u = User(id=new_id(), email=email.strip().lower(), full_name=name.strip() or None, password_hash=hash_pwd(pw1))
-                db.add(u); db.commit()
-                st.session_state["user_id"] = u.id
-                st.session_state["user_name"] = u.full_name or u.email
-                ensure_user_defaults(u.id, u.email, db=db)
-                adopt_legacy_rows(u.id, db=db)
-                st.success("Account created!")
+                with SessionLocal() as db2:
+                    exists = db2.execute(select(User).where(User.email == email.strip().lower())).scalar_one_or_none()
+                    if exists:
+                        st.error("Email already registered."); return
+                    u = User(id=new_id(), email=email.strip().lower(), full_name=name.strip() or None, password_hash=hash_pwd(pw1))
+                    db2.add(u); db2.commit()
+                st.success("Account created! Please sign in.")
+                st.query_params.clear()  # clear any stray params
+
+
+def recover_account_page():
+    st.title("🔐 Recover your account")
+    st.write("Enter your account email. We’ll send a reset link (and a one-time code).")
+    with SessionLocal() as db:
+        with st.form("recover_form"):
+            email = st.text_input("Your account email")
+            send_btn = st.form_submit_button("Send reset link", type="primary")
+        if send_btn:
+            u = db.execute(select(User).where(User.email == email.strip().lower())).scalar_one_or_none()
+            if not u:
+                st.success("If an account exists for that email, a reset link will be sent.")
+                return
+            token = new_id()
+            code = f"{random.randint(0, 999999):06d}"
+            expires = datetime.now(timezone.utc) + timedelta(hours=2)
+            pr = PasswordReset(user_id=u.id, token=token, code=code, expires_at=expires)
+            db.add(pr); db.commit()
+
+            link = None
+            if APP_BASE_URL:
+                link = f"{APP_BASE_URL.rstrip('/')}/?reset_token={token}"
+
+            body_lines = [
+                "Hi,",
+                "",
+                "We received a request to reset your Doggy Diary password.",
+                f"One-time code: {code}",
+            ]
+            if link:
+                body_lines += ["", f"Reset link: {link}", "", "This link expires in 2 hours."]
+            else:
+                body_lines += ["", "Open the app and choose 'Reset Password', then enter this code.", "This code expires in 2 hours."]
+            body_lines += ["", "If you didn’t request this, you can ignore this email."]
+            sent = send_email(u.email, "Reset your Doggy Diary password", "\n".join(body_lines))
+
+            if sent:
+                st.success("Check your email for the reset link/code.")
+            else:
+                st.warning("Email isn’t configured here. Use the one-time code below to reset now.")
+                with st.expander("Reset now with one-time code", expanded=True):
+                    st.code(code)
+                    st.session_state["pending_reset_email"] = u.email
+                    if st.button("Continue to Reset Password", type="primary"):
+                        st.session_state.page = "Reset Password"; st.rerun()
+
+    if st.button("Back to Sign in"):
+        st.session_state.page = "Home"; st.rerun()
+
+
+def reset_password_page():
+    st.title("🔑 Reset password")
+    with SessionLocal() as db:
+        token = st.session_state.get("reset_token")
+        email_prefill = st.session_state.get("pending_reset_email", "")
+        tab_link, tab_code = st.tabs(["Use link", "Use one-time code"])
+
+        with tab_link:
+            st.caption("If you clicked a link from your email, it should appear here automatically.")
+            tcol = st.columns([0.6, 0.4])
+            token_in = tcol[0].text_input("Reset token", value=token or "", help="If empty, paste the token or use the code tab.")
+            if tcol[1].button("Load", use_container_width=True):
+                st.session_state["reset_token"] = token_in.strip()
                 st.rerun()
+            if token_in:
+                pr = db.execute(select(PasswordReset).where(PasswordReset.token == token_in)).scalar_one_or_none()
+                if not pr or pr.used_at or (pr.expires_at and pr.expires_at < datetime.now(timezone.utc)):
+                    st.error("This reset token is invalid or expired.")
+                else:
+                    u = db.execute(select(User).where(User.id == pr.user_id)).scalar_one_or_none()
+                    st.success(f"Resetting password for **{u.email}**")
+                    with st.form("reset_form_link"):
+                        p1 = st.text_input("New password", type="password")
+                        p2 = st.text_input("Confirm new password", type="password")
+                        ok = st.form_submit_button("Set new password", type="primary")
+                    if ok:
+                        if p1 != p2 or len(p1) < 6:
+                            st.error("Passwords must match and be at least 6 chars.")
+                        else:
+                            u.password_hash = hash_pwd(p1)
+                            pr.used_at = datetime.now(timezone.utc)
+                            db.commit()
+                            st.success("Password updated. You can sign in now.")
+                            st.session_state.pop("reset_token", None)
+
+        with tab_code:
+            with st.form("reset_form_code"):
+                email = st.text_input("Account email", value=email_prefill)
+                code = st.text_input("One-time code")
+                p1 = st.text_input("New password", type="password")
+                p2 = st.text_input("Confirm new password", type="password")
+                ok = st.form_submit_button("Set new password", type="primary")
+            if ok:
+                u = db.execute(select(User).where(User.email == email.strip().lower())).scalar_one_or_none()
+                if not u:
+                    st.error("No account for that email.")
+                else:
+                    pr = db.execute(select(PasswordReset)
+                                    .where(PasswordReset.user_id == u.id)
+                                    .order_by(PasswordReset.id.desc())).scalars().first()
+                    if not pr or pr.code != code or pr.used_at or (pr.expires_at and pr.expires_at < datetime.now(timezone.utc)):
+                        st.error("Invalid or expired code.")
+                    else:
+                        if p1 != p2 or len(p1) < 6:
+                            st.error("Passwords must match and be at least 6 chars.")
+                        else:
+                            u.password_hash = hash_pwd(p1)
+                            pr.used_at = datetime.now(timezone.utc)
+                            db.commit()
+                            st.success("Password updated. You can sign in now.")
+                            st.session_state.pop("pending_reset_email", None)
+
+    if st.button("Back to Sign in"):
+        st.session_state.page = "Home"; st.rerun()
 
 
-# ---------------- Sidebar & main routing ----------------
+# ---------------- Contact Us ----------------
+def contact_page():
+    st.title("💬 Contact us")
+    st.write("Questions, issues, or feedback? Send us a message and we’ll get back to you.")
+    with SessionLocal() as db:
+        if current_user_id():
+            u = db.execute(select(User).where(User.id == current_user_id())).scalar_one_or_none()
+            from_email_default = u.email if u else ""
+        else:
+            from_email_default = ""
+
+    with st.form("contact_form"):
+        from_email = st.text_input("Your email", value=from_email_default)
+        subject = st.text_input("Subject")
+        message = st.text_area("Message", height=160)
+        ok = st.form_submit_button("Send message", type="primary")
+    if ok:
+        if not from_email.strip() or "@" not in from_email:
+            st.error("Please enter a valid email so we can reply.")
+        elif not subject.strip() or not message.strip():
+            st.error("Please add a subject and a message.")
+        else:
+            body = f"From: {from_email}\n\n{message}"
+            sent = send_email(SUPPORT_TO, f"[Doggy Diary] {subject.strip()}", body)
+            if sent:
+                st.success("Message sent. Thanks for reaching out!")
+            else:
+                # Fallback: save to local inbox file
+                ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+                inbox = DATA_DIR / "support_inbox.csv"
+                line = f'"{ts}","{from_email.replace("\"","\'")}","{subject.replace("\"","\'")}","{message.replace("\"","\'").replace("\n","\\n")}"\n'
+                if not inbox.exists():
+                    inbox.write_text('timestamp,from_email,subject,message\n', encoding="utf-8")
+                with open(inbox, "a", encoding="utf-8") as f:
+                    f.write(line)
+                st.info("Message saved for review. (Email delivery is not configured on this server.)")
+
+    if st.button("Back"):
+        st.session_state.page = "Home"; st.rerun()
+
+
+# ---------------- Admin ----------------
+def admin_page():
+    if not is_admin():
+        st.warning("Admin access only."); return
+
+    topbar()
+    st.title("🛡️ Admin Dashboard")
+
+    with SessionLocal() as db:
+        st.subheader("Overview")
+        total_users = db.execute(select(func.count(User.id))).scalar_one() or 0
+        total_dogs = db.execute(select(func.count(Dog.id))).scalar_one() or 0
+        total_bookings = db.execute(select(func.count(Booking.id))).scalar_one() or 0
+
+        c = st.columns(3)
+        c[0].metric("Users", f"{total_users}")
+        c[1].metric("Dogs", f"{total_dogs}")
+        c[2].metric("Bookings", f"{total_bookings}")
+
+        st.markdown("### Users")
+        q = st.text_input("Search users by email", value="")
+        users = db.execute(select(User).order_by(User.created_at.desc())).scalars().all()
+        if q.strip():
+            users = [u for u in users if q.lower() in (u.email or "").lower()]
+
+        for u in users:
+            with st.container():
+                cols = st.columns([0.3, 0.25, 0.25, 0.2])
+                cols[0].write(f"**{u.email}**")
+                # per-user quick stats
+                u_dogs = db.execute(select(func.count(Dog.id)).where(Dog.owner_id == u.id)).scalar_one() or 0
+                u_book = db.execute(select(func.count(Booking.id)).where(Booking.owner_id == u.id)).scalar_one() or 0
+                cols[1].write(f"Dogs: {u_dogs}")
+                cols[2].write(f"Bookings: {u_book}")
+                if cols[3].button("Impersonate", key=f"imp_{u.id}"):
+                    st.session_state["user_id"] = u.id
+                    st.session_state["user_name"] = u.full_name or u.email
+                    st.session_state["impersonated_by_admin"] = True
+                    st.session_state.page = "Home"
+                    st.rerun()
+
+        st.markdown("---")
+        st.subheader("Global Bookings (read-only here)")
+        # quick window
+        today = datetime.now().date()
+        sU = datetime.combine(today - timedelta(days=7), time.min).replace(tzinfo=tz.gettz(DEFAULT_TZ)).astimezone(timezone.utc)
+        eU = datetime.combine(today + timedelta(days=21), time.max).replace(tzinfo=tz.gettz(DEFAULT_TZ)).astimezone(timezone.utc)
+        rows = []
+        q = (select(Booking, Dog, User)
+             .join(Dog, Dog.id == Booking.dog_id)
+             .join(User, User.id == Booking.owner_id)
+             .where(Booking.start_utc < eU, Booking.end_utc > sU)
+             .order_by(Booking.start_utc.desc()))
+        for b, d, u in db.execute(q).all():
+            rows.append({
+                "User": u.email, "Dog": d.name, "Service": b.service_type, "Status": b.status,
+                "Paid": bool(b.paid), "Start": b.start_utc, "End": b.end_utc, "Price": b.price
+            })
+        gdf = pd.DataFrame(rows)
+        if gdf.empty:
+            st.info("No bookings in the global window.")
+        else:
+            st.dataframe(gdf, use_container_width=True, height=280)
+            st.caption("To edit a specific booking/dog, impersonate the user above and use the standard screens.")
+
+
+# ---------------- Sidebar & routing ----------------
 def sidebar_nav():
     with st.sidebar:
         st.header("Doggy Diary")
-        st.caption(f"Signed in as **{st.session_state.get('user_name','Not signed in')}**")
+        who = st.session_state.get('user_name','Not signed in')
+        if is_admin() and st.session_state.get("impersonated_by_admin") and current_user_id():
+            who = f"Admin (as {who})"
+        st.caption(f"Signed in as **{who}**")
+        if is_admin():
+            if st.button("🛡️ Admin", key="sb_admin_btn", use_container_width=True):
+                st.session_state.page = "Admin"; st.rerun()
         if st.button("👤 My Profile", key="sb_profile_btn", use_container_width=True):
             st.session_state.page = "My Profile"; st.rerun()
         if st.button("🏠 Home", key="sb_home_btn", use_container_width=True):
@@ -1686,19 +2012,33 @@ def sidebar_nav():
             st.session_state.page = "Settings"; st.rerun()
         if st.button("📤 Export (.ics)", key="sb_export_btn", use_container_width=True):
             st.session_state.page = "Export"; st.rerun()
+        st.markdown("---")
+        if st.button("💬 Contact us", key="sb_contact_btn", use_container_width=True):
+            st.session_state.page = "Contact Us"; st.rerun()
 
 def main():
     if "page" not in st.session_state:
         st.session_state.page = "Home"
     sidebar_nav()
     p = st.session_state.page
-    if p == "Home":
-        if not current_user_id():
+    if p == "Admin":
+        admin_page()
+    elif p == "Home":
+        if not current_user_id() and not is_admin():
             auth_page()
         else:
             nav_home()
+    elif p == "Recover Account":
+        recover_account_page()
+    elif p == "Reset Password":
+        reset_password_page()
+    elif p == "Contact Us":
+        contact_page()
     elif p == "My Profile":
-        my_profile_section()
+        if not current_user_id():
+            auth_page()
+        else:
+            my_profile_section()
     elif p == "Doggy Profiles":
         dogs_section()
     elif p == "Bookings":
